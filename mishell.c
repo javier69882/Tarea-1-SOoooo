@@ -30,16 +30,52 @@ void leer_linea(char *linea, size_t tamaño_de_la_linea){
     linea[strcspn(linea, "\n")] = '\0';// quito el salto de linea
 
 }
-int tokenizador(char *linea, char **argv, int max){//argv es el vector de los argumentos, argc es el contador
-    int argc = 0;
-    char *token = strtok(linea, " \t");
-    while(token && argc<max-1){
-        char *token_actual=token;
-        argv[argc]=token_actual; // lo guardo en el vector
-        argc++;
-        token = strtok(NULL, " \t");// pido el token que vien
+int tokenizador(char *linea, char **argv, int max) {
+    const char separador[]=" \t";
+    const char marcador='\x1F'; //para espacios en comillas
+    int argc=0;
+    int en_comillas=0;
+    char tipo=0;
 
+    //linea caracter por caracter
+    for(int i=0; linea[i]!='\0'; i++){
+        if(!en_comillas && (linea[i]=='"' || linea[i]=='\'')){
+            en_comillas=1;
+            tipo=linea[i];
+            //elimino la comilla corriebndo todo
+            for(int j=i;linea[j]!='\0'; j++){
+                linea[j]=linea[j+1];
+            }
+            i--;
+            continue;
+            
+        }
+        if(en_comillas && linea[i]==tipo){
+            en_comillas= 0;
+            tipo=0;
+            for(int j=i; linea[j]!='\0'; j++){
+                linea[j]=linea[j+1];
+            }
+            i--;
+            continue;
+        }
+        if(en_comillas && (linea[i]==' ' || linea[i]=='\t')) {
+            linea[i]=marcador; // cambio espacio por el marcador
+        }
     }
+    char *tok=strtok(linea, separador);
+    while (tok!=NULL && argc < max-1) {
+        // vuelvo a poner los espcaios donde estaba el marcdador
+        for(int k=0; tok[k]!='\0'; k++){
+            if(tok[k]==marcador){
+                tok[k]=' ';
+            } 
+        }
+        argv[argc++] = tok;
+        tok = strtok(NULL, separador);
+    }
+
+
     argv[argc] = NULL;
     return argc;
 }
@@ -48,7 +84,7 @@ int ejecutar_comando(char **argv){
     pid_t pid =fork(); //creo a un hijo para que ejecute el comando
 
     if(pid==0){ // el hijo
-        printf("Resultado obtenido del comando: \n\n");
+        
         
         execvp(argv[0],argv);//ejecuta el comando
         perror("Hubo un error");//solo se ejecuta si falla
@@ -115,7 +151,7 @@ int ejecutar_comando_con_pipe(char **argv, int argc){
     //fd[1][1] se escribe el pipe 2
     // ademas hay que cerrar los pipes, si no se hace puede ocasionar errores y bloqueos
 
-    printf("Resultado obtenido del comando: \n\n");
+    
     for (int i=0;i<num_comandos;i++){
         pid_t pid = fork();
         if(pid == 0){// estoy en el hijo

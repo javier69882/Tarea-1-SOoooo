@@ -18,7 +18,7 @@
 void leer_linea(char *linea, size_t tamaño_de_la_linea){
 
     //muestra el
-    printf("mishell:$ ");
+    printf("\033[1;32mmishell:$ \033[0m");
     fflush(stdout);
     //prompt
 

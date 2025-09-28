@@ -15,10 +15,196 @@
 #include <signal.h>
 
 
+//timeout para pipelines por grupo de procesos, esto sirve para cerrar toda la cola de procesos restantes de los pipes luego de que termine el max time
+static volatile pid_t g_pgid = -1;
+
+static void tiempo_agotado_killpg(int sig) {
+    (void)sig;
+    if(g_pgid > 0) {
+        killpg(g_pgid, SIGKILL);
+    }
+}
+
+
+//ejecuta comando simple y devuelve rusage del hijo, esto nos sirve para obtener los tiempos de ejecucion de los comandos que no tengan pipes
+int ejecutar_comando_medido(char **argv, int max_tiempo, struct rusage *out_ru){
+    memset(out_ru, 0, sizeof(*out_ru));
+
+    pid_t pid = fork();
+    if(pid == 0){
+        if(max_tiempo > 0){
+            signal(SIGALRM, SIG_DFL);  // por si heredo algo raro
+            alarm(max_tiempo);
+        }
+        execvp(argv[0], argv);
+        perror("execvp");
+        _exit(1);
+    }else if(pid < 0){
+        perror("fork");
+        return -1;
+    }else{
+        int status;
+        struct rusage ru_child;
+        if(wait4(pid, &status, 0, &ru_child) == -1) {
+            perror("wait4");
+            return -1;
+        }
+        *out_ru = ru_child;
+        return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+}
+
+
+
+
+//este sirve para obtener los tiempos de ejecucion y ejecutar los comandos con pipes
+int ejecutar_comando_con_pipe_medido(char **argv, int argc, int max_tiempo, struct rusage *out_ru) {
+    memset(out_ru, 0, sizeof(*out_ru));
+
+    // Contar pipes y poner comandos
+    int contador_pipes = 0;
+    for(int i = 0; i < argc; i++){
+        if(strcmp(argv[i], "|") == 0){
+            contador_pipes++;
+        } 
+    } 
+    int num_comandos=contador_pipes+ 1;
+
+    char **comandos[num_comandos];
+    int j=0;
+    comandos[j]=&argv[0];
+    for(int i = 0; i < argc; i++){
+        if(strcmp(argv[i], "|")==0){
+            argv[i]=NULL;
+            j++;
+            comandos[j]=&argv[i+1];
+        }
+    }
+
+    //Crear pipes
+    int cantidad_de_fd = contador_pipes;
+    int fd[cantidad_de_fd][2];
+    for(int i = 0; i < cantidad_de_fd; i++){
+        if(pipe(fd[i]) == -1){
+            perror("pipe");
+            return -1;
+        }
+    }
+
+    //timeout por grupo, usa helper de timeout
+    g_pgid= -1;
+    if(max_tiempo > 0){
+        signal(SIGALRM, tiempo_agotado_killpg);
+        alarm(max_tiempo);
+    }
+
+    //fork de cada etapa
+    pid_t first_pid=-1;
+    for(int i= 0; i < num_comandos; i++){
+        pid_t pid = fork();
+        if (pid == 0) {
+            if(i == 0){
+                setpgid(0, 0);
+            }
+            else{
+                setpgid(0, first_pid);
+            }        
+
+            if(i > 0){
+                if(dup2(fd[i-1][0], STDIN_FILENO)== -1){
+                    perror("dup2 stdin"); _exit(1);
+                }
+            }
+            if(i < cantidad_de_fd){
+                if (dup2(fd[i][1], STDOUT_FILENO) == -1){
+                    perror("dup2 stdout");
+                    _exit(1);
+                }
+            }
+
+            for(int k=0; k < cantidad_de_fd; k++){
+                close(fd[k][0]);
+                close(fd[k][1]);
+            }
+
+            execvp(comandos[i][0], comandos[i]);
+            perror("execvp");
+            _exit(1);
+        } else if (pid < 0) {
+            perror("fork");
+            for (int k = 0; k < cantidad_de_fd; k++){
+                close(fd[k][0]); close(fd[k][1]);
+            }
+            if(max_tiempo > 0){
+                alarm(0);
+            } 
+            return -1;
+        } else{
+            if(i == 0){
+                first_pid=pid;
+                setpgid(pid, pid);
+                g_pgid = pid;
+            }
+            else{
+                setpgid(pid, first_pid);
+            }
+        }
+    }
+
+    //cerrar extremos en el padre
+    for(int k = 0; k < cantidad_de_fd; k++){
+        close(fd[k][0]); close(fd[k][1]);
+    }
+
+    
+   //esperar cada etapa y acumula rusage de cada comando entre pipes
+for(int i = 0; i < num_comandos; i++){
+    int status;
+    struct rusage ru_step;
+    if(wait4(-1, &status, 0, &ru_step) == -1){
+        perror("wait4 pipeline");
+        if(max_tiempo > 0){
+            alarm(0);}
+        return -1;
+    }
+
+    //suma de tiempos para desplegar en pantalla
+    out_ru->ru_utime.tv_sec  += ru_step.ru_utime.tv_sec;
+    out_ru->ru_utime.tv_usec += ru_step.ru_utime.tv_usec;
+    out_ru->ru_stime.tv_sec  += ru_step.ru_stime.tv_sec;
+    out_ru->ru_stime.tv_usec += ru_step.ru_stime.tv_usec;
+
+    // aca se pasan los microsegundos a segundos cuando estos llegan al limite
+    if(out_ru->ru_utime.tv_usec >= 1000000){
+        out_ru->ru_utime.tv_sec += out_ru->ru_utime.tv_usec / 1000000;
+        out_ru->ru_utime.tv_usec %= 1000000;
+    }
+    if(out_ru->ru_stime.tv_usec >= 1000000){
+        out_ru->ru_stime.tv_sec += out_ru->ru_stime.tv_usec / 1000000;
+        out_ru->ru_stime.tv_usec %= 1000000;
+    }
+
+    //memoria maxima, toma el max entre etapas del pipeline
+    if(ru_step.ru_maxrss > out_ru->ru_maxrss){
+        out_ru->ru_maxrss = ru_step.ru_maxrss;
+    }
+}
+
+
+    if(max_tiempo > 0){
+        alarm(0);
+
+    } 
+    g_pgid = -1;
+
+    return 0;
+}
+
+
 void leer_linea(char *linea, size_t tamaño_de_la_linea){
 
     //muestra el
-    printf("\033[1;32mmishell:$ \033[0m");
+    printf("\033[1;32mmishell:$ \033[0m"); //tiene otro color
     fflush(stdout);
     //prompt
 
@@ -231,156 +417,117 @@ void ejecutar_miprof(char **argv, int argc) {
     char *output_file = NULL;
     char **comando_argv = NULL;
     int comando_argc = 0;
-    struct timespec inicio, fin;
-    struct rusage uso;
     int max_tiempo = 0;
 
-    //comenzamos el contador total aca, desde que se reconoce la linea de comandos
-    clock_gettime(CLOCK_MONOTONIC, &inicio);
-
-    //revisamos si hay pipes en la linea de comandos
+    // detectamos si tiene pipes
     bool tiene_pipes = false;
-    for (int i = 0; i < argc; i++) {
-        if (strcmp(argv[i], "|") == 0) {
+    for(int i = 0; i < argc; i++){
+        if(strcmp(argv[i], "|") == 0){
             tiene_pipes = true;
             break;
         }
     }
-    
-
+    //aca detectamos si luego del comando miprof se ingresa "ejec", "ejecsave", "ejecutar" o " "(el cual funciona como ejec), ademas asignamos los siguientes parametros
+    // dependiendo de cual miprof estamos utilizando, por ejemplo, con ejecsave, el siguiente parametro se guarda como el archivo de texto donde se guardaran los resultados(sobreescribiendo de existir)
     int inicio_comando = 1;
-    // aca detectamos el modo ejec, sus comandos y argumentos
-    if (argc >= 2 && strcmp(argv[1], "ejec") == 0) {
+    if(argc>=2 && strcmp(argv[1], "ejec")== 0){
         comando_argv = &argv[2];
         comando_argc = argc - 2;
         inicio_comando = 2;
     }
-    //en el caso que sea ejecsave se detecta aca, y se analiza el nombre del archivo localizado en el indice 2 del arreglo de tokens
-    else if (argc >= 3 && strcmp(argv[1], "ejecsave") == 0) {
-        output_file = argv[2];
-        comando_argv = &argv[3];
-        comando_argc = argc - 3;
+    else if(argc> 3 && strcmp(argv[1], "ejecsave")==0){
+        output_file = argv[2]; comando_argv = &argv[3];
+        comando_argc = argc-3;
         inicio_comando = 3;
     }
-    
-    else if (argc >= 3 && strcmp(argv[1], "ejecutar") == 0) {
+    else if(argc>= 3 && strcmp(argv[1], "ejecutar")== 0){
         max_tiempo = atoi(argv[2]);
         comando_argv = &argv[3];
-        comando_argc = argc - 3;
+        comando_argc = argc-3;
         inicio_comando = 3;
     }
-    
-    else {
-        //aca, si no se escribe ejec o ejecsave despues de miprof, el comando funcionara como si llevara ejec
-        comando_argv = &argv[1];
-        comando_argc = argc - 1;
+    else{
+        comando_argv = &argv[1]; comando_argc = argc - 1;
     }
-    
-    // primero verificamos si se ingresaron comandos, de no ser asi, lanzamos codigo de error y volvemos a estado de ingresar linea en consola para la lectura
-    if (comando_argc < 1) {
-        printf("Error: formato correcto: miprof [ |ejec|ejecsave archivo] <comando> [argumentos...]\n");
-        printf("Ejemplos:\n");
-        printf("  miprof ls\n");
-        printf("  miprof ejec ls\n");
-        printf("  miprof ejecsave resultado.txt ls\n");
+    // se imprime el formato correcto en caso de ingresar mal el comando
+    if(comando_argc < 1){
+        printf("Error: formato correcto: miprof [ |ejec|ejecsave archivo|ejecutar seg] <comando> [args...]\n");
         return;
     }
-    
-
-    
-    if (output_file) {
+    if(output_file){
         printf("\nResultados se guardarán en: %s\n\n", output_file);
     }
-    
-    
-    
-    pid_t pid = fork();
-    
-    if (pid == 0) {
-        // proceso hijo ejecuta el comando
-        if (max_tiempo > 0) {
-            signal(SIGALRM, tiempo_agotado);
-            alarm(max_tiempo);
-        }
-        
-        
+    //aca se inicializan los structs para tomar los tiempos, y ademas se inicia el contador de tiempo para calcular el tiempo real
+    struct timespec inicio, fin;
+    clock_gettime(CLOCK_MONOTONIC, &inicio);
 
-        if (tiene_pipes) {
-            char **comando_con_pipes = &argv[inicio_comando];
-            int argc_comando = argc - inicio_comando;
-            
-            ejecutar_comando_con_pipe(comando_con_pipes, argc_comando);
-            exit(0);
-        }else {
-            // Comando simple
-            execvp(comando_argv[0], comando_argv);
-            exit(1);
-        }
+    struct rusage ru_total;
+    memset(&ru_total, 0, sizeof(ru_total));
+    int rc;
+    // de tener pipes el comando se utiliza ejecutar_comando_con_pipe_medido
+    if(tiene_pipes){
+        char **comando_con_pipes=&argv[inicio_comando];
+        int argc_comando = argc-inicio_comando;
+        rc=ejecutar_comando_con_pipe_medido(comando_con_pipes, argc_comando, max_tiempo, &ru_total);
     }
-    else if (pid > 0) {
-        // proceso padre espera a que el proceso hijo termine y toma los datos de tiempo y uso
-        int status;
-        waitpid(pid, &status, 0);
-        
-        // detectar timeout en el padre
-        if (WIFSIGNALED(status)) {
-            int signal_num = WTERMSIG(status);
-            if (signal_num == SIGALRM) {
-                printf("Se agoto el tiempo, finalizando el proceso.\n");
-            }
-        }
-
-
-        //finalizamos el contador de tiempo total
-        clock_gettime(CLOCK_MONOTONIC, &fin);
-        getrusage(RUSAGE_CHILDREN, &uso);
-        
-        //calculamos tiempo real, tiempo de usuario y tiempo de sistema
-        double real_time = (fin.tv_sec - inicio.tv_sec) + 
-                          (fin.tv_nsec - inicio.tv_nsec) / 1000000000.0;
-        
-        double user_time = uso.ru_utime.tv_sec + uso.ru_utime.tv_usec / 1000000.0;
-        double system_time = uso.ru_stime.tv_sec + uso.ru_stime.tv_usec / 1000000.0;
-        
-        //  mostramos los resultados en pantalla
-        printf("\nRESULTADOS MIPROF\n");
-        printf("Comando ingresado: ");
-        for (int i = 0; i < comando_argc; i++) {
-            printf("%s ", comando_argv[i]);
-        }
-        printf("\n");
-        printf("Tiempo real: %.6f segundos\n", real_time);
-        printf("Tiempo usuario: %.6f segundos\n", user_time);
-        printf("Tiempo sistema: %.6f segundos\n", system_time);
-        printf("Memoria máxima: %ld KB\n", uso.ru_maxrss);
-        
-        //  en caso de haber outputfile al usar ejecsave, guardamos los resultados concatenandolos a los anteriores
-        if (output_file) {
-            FILE *archivo = fopen(output_file, "a");
-            if (archivo) {
-                fprintf(archivo, "RESULTADOS MIPROF\n");
-                fprintf(archivo, "Comando: ");
-                for (int i = 0; i < comando_argc; i++) {
-                    fprintf(archivo, "%s ", comando_argv[i]);
-                }
-                fprintf(archivo, "\n");
-                fprintf(archivo, "Tiempo real: %.6f segundos\n", real_time);
-                fprintf(archivo, "Tiempo usuario: %.6f segundos\n", user_time);
-                fprintf(archivo, "Tiempo sistema: %.6f segundos\n", system_time);
-                fprintf(archivo, "Memoria máxima: %ld KB\n", uso.ru_maxrss);
-                fprintf(archivo, "\n");
-                fclose(archivo);
-                printf("Resultados guardados en: %s\n", output_file);
-            } else {
-                printf("Error abriendo archivo: %s\n", output_file);
-            }
-        }
+    // de no tener pipes se ejecuta ejecutar_comando_medido
+    else{
+        rc=ejecutar_comando_medido(comando_argv, max_tiempo, &ru_total);
     }
-    else {
-        perror("Error en fork");
+    if(rc!=0){
+        perror("Error de rc");
+    }
+    //aca se finaliza el contador de tiempo final para poder realizar los calculos e imprimir en pantalla
+    clock_gettime(CLOCK_MONOTONIC, &fin);
+
+    double real_time=(fin.tv_sec - inicio.tv_sec) + (fin.tv_nsec - inicio.tv_nsec) / 1e9;
+    double user_time =ru_total.ru_utime.tv_sec + ru_total.ru_utime.tv_usec / 1e6;
+    double system_time=ru_total.ru_stime.tv_sec + ru_total.ru_stime.tv_usec / 1e6;
+
+    //salida por pantalla
+    printf("\nRESULTADOS MIPROF\n");
+    printf("Comando ingresado: ");
+    for(int i = inicio_comando; i<argc;i++){
+        if(argv[i]==NULL){
+            printf("| ");
+        } 
+        else{
+            printf("%s ", argv[i]);
+        }                
+    }
+    printf("\n");
+    printf("Tiempo real: %.6f s\n", real_time);
+    printf("Tiempo usuario: %.6f s\n", user_time);
+    printf("Tiempo sistema: %.6f s\n", system_time);
+    printf("Memoria máxima (ru_maxrss): %ld KB\n", ru_total.ru_maxrss);
+
+    //salida a archivo 
+    if (output_file) {
+        FILE *archivo = fopen(output_file, "a");
+        if (archivo) {
+            fprintf(archivo, "RESULTADOS MIPROF\n");
+            fprintf(archivo, "Comando: ");
+            for(int i=inicio_comando; i < argc; i++){
+                if(argv[i]==NULL){
+                    fprintf(archivo, "| ");
+                } 
+                else{
+                    fprintf(archivo, "%s ", argv[i]);
+                }                 
+            }
+            fprintf(archivo, "\n");
+            fprintf(archivo, "Tiempo real: %.6f s\n", real_time);
+            fprintf(archivo, "Tiempo usuario: %.6f s\n", user_time);
+            fprintf(archivo, "Tiempo sistema: %.6f s\n", system_time);
+            fprintf(archivo, "Memoria máxima: %ld KB\n\n", ru_total.ru_maxrss);
+            fclose(archivo);
+            printf("Resultados guardados en: %s\n", output_file);
+        }
+        else {
+            printf("Error abriendo archivo: %s\n", output_file);
+        }
     }
 }
-
 
 
 

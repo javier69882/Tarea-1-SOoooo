@@ -1,0 +1,6 @@
+RESULTADOS MIPROF
+Comando: ls -la 
+Tiempo real: 0.011055 segundos
+Tiempo usuario: 0.000000 segundos
+Tiempo sistema: 0.000000 segundos
+Memoria máxima: 1396 KB
